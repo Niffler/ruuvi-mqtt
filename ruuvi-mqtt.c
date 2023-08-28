@@ -1,7 +1,8 @@
+// Copyright (c) 2023 Niffler
 // Copyright (c) 2021 David G. Young
 // Copyright (c) 2015 Damian Kołakowski. All rights reserved.
 
-// cc ruuvi-mqtt.c -lbluetooth -o ruuvie-mqtt
+// cc ruuvi-mqtt.c -lbluetooth -lpaho-mqtt3c -o ruuvi-mqtto
 
 #include <stdlib.h>
 #include <errno.h>
@@ -13,8 +14,24 @@
 #include <bluetooth/hci.h>
 #include <bluetooth/hci_lib.h>
 #include <time.h>
+#include <MQTTClient.h>
+
+#define ADDRESS "tcp://localhost:1883"
+#define CLIENTID "Ruuvi Bridge"
+#define TOPIC "ruuvi"
+#define QOS 1
+#define TIMEOUT 10000L
+
+typedef struct ruuvi_data
+{
+    char *addr;
+    int16_t temperature;
+    uint16_t humidity;
+    uint16_t pressure;
+} ruuvi_data;
 
 int device;
+MQTTClient client;
 
 struct hci_request ble_hci_request(uint16_t ocf, int clen, void *status, void *cparam)
 {
@@ -46,21 +63,74 @@ void exit_clean()
         perror("Failed to disable scan.");
 
     hci_close_dev(device);
+
+    // Close mqtt connection
+
+    int rc;
+    if ((rc = MQTTClient_disconnect(client, 10000)) != MQTTCLIENT_SUCCESS)
+        printf("Failed to disconnect, return code %d\n", rc);
+    MQTTClient_destroy(&client);
+
     exit(0);
 }
 
 // handles timeout
 void signal_handler(int s)
 {
-    // printf( "received SIGALRM\n" );
+    printf("received SIGALRM\n");
     exit_clean();
 }
 
-void parse_ruuvi_payload() {}
+int ruuvi_data_to_json(size_t len, char json_string[len], ruuvi_data data)
+{
+    return snprintf(json_string, 512, "{\"MAC\":\"%s\",\"temperature\":%hd,\"humidity\":%hu,\"pressure\":%hu}", data.addr, data.temperature, data.humidity, data.pressure);
+}
+
+void publish_ruuvi_data(MQTTClient_message *message, MQTTClient_deliveryToken *token, ruuvi_data data)
+{
+    char json_payload[512];
+    int rc = ruuvi_data_to_json(512, json_payload, data);
+    message->payload = json_payload;
+    message->payloadlen = (int)strlen(json_payload);
+    message->qos = QOS;
+    message->retained = 0;
+
+    if ((rc = MQTTClient_publishMessage(client, TOPIC, message, token)) != MQTTCLIENT_SUCCESS)
+    {
+        printf("Failed to publish message, return code %d\n", rc);
+        exit(EXIT_FAILURE);
+    }
+}
 
 int main()
 {
+    // MQTT variables
+    MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+    MQTTClient_message pubmsg = MQTTClient_message_initializer;
+    MQTTClient_deliveryToken token;
+    int rc;
+
+    // BLE variables
     int ret, status;
+
+    // Create MQTT client
+
+    if ((rc = MQTTClient_create(&client, ADDRESS, CLIENTID,
+                                MQTTCLIENT_PERSISTENCE_NONE, NULL)) != MQTTCLIENT_SUCCESS)
+    {
+        printf("Failed to create client, return code %d\n", rc);
+        exit(EXIT_FAILURE);
+    }
+
+    // Connect to MQTT server
+
+    conn_opts.keepAliveInterval = 20;
+    conn_opts.cleansession = 1;
+    if ((rc = MQTTClient_connect(client, &conn_opts)) != MQTTCLIENT_SUCCESS)
+    {
+        printf("Failed to connect, return code %d\n", rc);
+        exit(EXIT_FAILURE);
+    }
 
     // Get HCI device.
 
@@ -182,8 +252,7 @@ int main()
         return 0;
     }
 
-    // Keep scanning until the timeout is triggered or we have seen lots of advertisements.  Then exit.
-    // We exit in this case because the scan may have failed or stopped. Higher level code can restart
+    // Keep scanning until the timeout is triggered. Then exit.
     while (1)
     {
         len = read(device, buf, sizeof(buf));
@@ -202,6 +271,9 @@ int main()
                 while (reports_count--)
                 {
                     info = (le_advertising_info *)offset;
+
+                    // filter for ruuvi advertisements
+                    // Manufacturer ID, least significant byte first: 0x0499 = Ruuvi Innovations Ltd
                     if (info->data[5] == 0x99 && info->data[6] == 0x04)
                     {
                         char addr[18];
@@ -215,15 +287,16 @@ int main()
                         uint16_t hum_raw = (info->data[10] << 8) + info->data[11];
                         double hum = hum_raw * 0.0025;
                         printf(" hum: %.2f", hum);
-                        
+
                         uint16_t pres_raw = (info->data[12] << 8) + info->data[13];
                         double pres = (pres_raw + 50000) / 100.0;
                         printf(" pres: %.2f", pres);
-                        
-
-                        // for (int i = 0; i < info->length; i++)
-                        //     printf(" %02X", (unsigned char)info->data[i]);
                         printf("\n");
+
+                        // TODO: parse payload further: accel, power, movement, ...
+
+                        ruuvi_data data = {.addr = addr, .temperature = temp_raw, .humidity = hum_raw, .pressure = pres_raw};
+                        publish_ruuvi_data(&pubmsg, &token, data);
                     }
                     offset = info->data + info->length + 2;
                 }
@@ -242,4 +315,3 @@ int main()
     exit_clean();
     return 0;
 }
-
