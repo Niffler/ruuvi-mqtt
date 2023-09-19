@@ -20,14 +20,20 @@
 #define CLIENTID "Ruuvi Bridge"
 #define TOPIC "ruuvi"
 #define QOS 1
-#define TIMEOUT 10000L
 
 typedef struct ruuvi_data
 {
-    char *addr;
+    char mac[18];
     int16_t temperature;
     uint16_t humidity;
     uint16_t pressure;
+    int16_t accel_x;
+    int16_t accel_y;
+    int16_t accel_z;
+    uint16_t battery_voltage;
+    uint8_t tx_power;
+    uint8_t movement_counter;
+    uint16_t measurement_seq;
 } ruuvi_data;
 
 int device;
@@ -81,9 +87,66 @@ void signal_handler(int s)
     exit_clean();
 }
 
+ruuvi_data parse_ruuvi_data(uint8_t data[], bdaddr_t bdaddr,
+                            uint8_t length)
+{
+    char addr[18];
+    ba2str(&(bdaddr), addr);
+    printf("%s %d", addr, (int8_t)data[length]);
+
+    int16_t temp_raw = (data[8] << 8) + data[9];
+    double temp = temp_raw * 0.005;
+    printf(" temp: %.2f", temp);
+
+    uint16_t hum_raw = (data[10] << 8) + data[11];
+    double hum = hum_raw * 0.0025;
+    printf(" hum: %.2f", hum);
+
+    uint16_t pres_raw = (data[12] << 8) + data[13];
+    double pres = (pres_raw + 50000) / 100.0;
+    printf(" pres: %.2f", pres);
+
+    int16_t accel_x = (data[14] << 8) + data[15];
+    printf(" accel_x: %d", accel_x);
+
+    int16_t accel_y = (data[16] << 8) + data[17];
+    printf(" accel_y: %d", accel_y);
+
+    int16_t accel_z = (data[18] << 8) + data[19];
+    printf(" accel_z: %d", accel_z);
+
+    uint16_t battery_voltage = (data[20] << 3) + (data[21] >> 5);
+    printf(" battery_voltage: %d", battery_voltage);
+
+    uint8_t tx_power = data[21] & 0x1F;
+    printf(" tx_power: %d", tx_power);
+
+    uint8_t movement_counter = data[22];
+    printf(" movement: %d", movement_counter);
+
+    uint16_t measurement_seq_nr = (data[23] << 8) + data[24];
+    printf(" measurement_seq_nr: %d", measurement_seq_nr);
+    printf("\n");
+
+    // bytes 25-26 are omitted as they contain the MAC which is equal to the BD address
+    ruuvi_data dat = {.temperature = temp_raw,
+                      .humidity = hum_raw,
+                      .pressure = pres_raw,
+                      .accel_x = accel_x,
+                      .accel_y = accel_y,
+                      .accel_z = accel_z,
+                      .battery_voltage = battery_voltage,
+                      .tx_power = tx_power,
+                      .movement_counter = movement_counter,
+                      .measurement_seq = measurement_seq_nr};
+                      strcpy(dat.mac, addr);
+    return dat;
+}
+
 int ruuvi_data_to_json(size_t len, char json_string[len], ruuvi_data data)
 {
-    return snprintf(json_string, 512, "{\"MAC\":\"%s\",\"temperature\":%hd,\"humidity\":%hu,\"pressure\":%hu}", data.addr, data.temperature, data.humidity, data.pressure);
+    printf("%s\n", data.mac);
+    return snprintf(json_string, 512, "{\"mac\":\"%s\",\"temperature\":%hd,\"humidity\":%hu,\"pressure\":%hu,\"accel_x\":%hd,\"accel_y\":%hd,\"accel_z\":%hd,\"battery_voltage\":%hu,\"tx_power\":%hhu,\"movement\":%hhu,\"seq\":%hu}", data.mac, data.temperature, data.humidity, data.pressure, data.accel_x, data.accel_y, data.accel_z, data.battery_voltage, data.tx_power, data.movement_counter, data.measurement_seq);
 }
 
 void publish_ruuvi_data(MQTTClient_message *message, MQTTClient_deliveryToken *token, ruuvi_data data)
@@ -276,26 +339,7 @@ int main()
                     // Manufacturer ID, least significant byte first: 0x0499 = Ruuvi Innovations Ltd
                     if (info->data[5] == 0x99 && info->data[6] == 0x04)
                     {
-                        char addr[18];
-                        ba2str(&(info->bdaddr), addr);
-                        printf("%s %d", addr, (int8_t)info->data[info->length]);
-
-                        int16_t temp_raw = (info->data[8] << 8) + info->data[9];
-                        double temp = temp_raw * 0.005;
-                        printf(" temp: %.2f", temp);
-
-                        uint16_t hum_raw = (info->data[10] << 8) + info->data[11];
-                        double hum = hum_raw * 0.0025;
-                        printf(" hum: %.2f", hum);
-
-                        uint16_t pres_raw = (info->data[12] << 8) + info->data[13];
-                        double pres = (pres_raw + 50000) / 100.0;
-                        printf(" pres: %.2f", pres);
-                        printf("\n");
-
-                        // TODO: parse payload further: accel, power, movement, ...
-
-                        ruuvi_data data = {.addr = addr, .temperature = temp_raw, .humidity = hum_raw, .pressure = pres_raw};
+                        ruuvi_data data = parse_ruuvi_data(info->data, info->bdaddr, info->length);
                         publish_ruuvi_data(&pubmsg, &token, data);
                     }
                     offset = info->data + info->length + 2;
